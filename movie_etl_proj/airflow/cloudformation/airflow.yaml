@@ -1,5 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Airflow server backed by Postgres RDS with VPC and subnets
+
+Description: Airflow server backed by Postgres RDS
 
 Parameters:
   KeyName:
@@ -53,108 +54,12 @@ Mappings:
       AMI: ami-ceafcba8
     ap-northeast-2:
       AMI: ami-863090e8
-
 Resources:
-  # New VPC with a different CIDR block
-  VPC:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.20.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-
-  # Internet Gateway
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-
-  # Attach Internet Gateway to VPC
-  GatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
-
-  # Subnets with different CIDR blocks
-  SubnetEC2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.20.1.0/24
-  SubnetEMRPrimary:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.20.2.0/24
-  SubnetEMRCore:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.20.3.0/24
-  SubnetDB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.20.4.0/24
-      AvailabilityZone: "ap-southeast-2a"
-  SubnetDB2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.20.5.0/24
-      AvailabilityZone: "ap-southeast-2b" 
-  DBSubnetGroup:
-    Type: AWS::RDS::DBSubnetGroup
-    Properties:
-      DBSubnetGroupDescription: "Subnet Group for RDS Instance"
-      SubnetIds:
-        - !Ref SubnetDB
-        - !Ref SubnetDB2
-
-  # Route Table
-  RouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref VPC
-
-  # Route to Internet
-  Route:
-    Type: AWS::EC2::Route
-    DependsOn: GatewayAttachment
-    Properties:
-      RouteTableId: !Ref RouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  # Subnet Route Table Associations
-  # ... [Associations for each subnet] ...
-  SubnetRouteTableAssociationEC2:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetEC2
-      RouteTableId: !Ref RouteTable
-
-  SubnetRouteTableAssociationEMRPrimary:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetEMRPrimary
-      RouteTableId: !Ref RouteTable
-
-  SubnetRouteTableAssociationEMRCore:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetEMRCore
-      RouteTableId: !Ref RouteTable
-
-  SubnetRouteTableAssociationDB:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref SubnetDB
-      RouteTableId: !Ref RouteTable
-
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
       KeyName: !Ref 'KeyName'
+      SecurityGroups: [!Ref 'AirflowEC2SecurityGroup']
       InstanceType: 'm4.xlarge'
       IamInstanceProfile:
         Ref: EC2InstanceProfile
@@ -162,13 +67,59 @@ Resources:
         -
           Key: Name
           Value: Airflow
-      ImageId: ami-0f2967bce46537146
-      NetworkInterfaces:
-        - DeviceIndex: "0"
-          SubnetId: !Ref SubnetEC2
-          AssociatePublicIpAddress: true
-          GroupSet:
-            - !GetAtt AirflowEC2SecurityGroup.GroupId
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - AMI
+      UserData:
+        Fn::Base64: !Sub |
+         #!/bin/bash
+         set -x
+         exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+         # Get the latest CloudFormation package
+         echo "Installing aws-cfn"
+         yum install -y aws-cfn-bootstrap
+         # Start cfn-init
+         /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+         # Download and unzip the Movielens dataset
+         wget http://files.grouplens.org/datasets/movielens/ml-latest.zip && unzip ml-latest.zip
+         # Upload the movielens dataset files to the S3 bucket
+         aws s3 cp ml-latest s3://${S3BucketName} --recursive
+         # Install git
+         sudo yum install -y git
+         # Clone the git repository
+         git clone https://github.com/aws-samples/aws-concurrent-data-orchestration-pipeline-emr-livy.git
+         sudo pip install boto3
+         # Install airflow using pip
+         echo "Install Apache Airflow"
+         sudo SLUGIFY_USES_TEXT_UNIDECODE=yes pip install -U apache-airflow
+         # Encrypt connection passwords in metadata db
+         sudo pip install apache-airflow[crypto]
+         # Postgres operators and hook, support as an Airflow backend
+         sudo pip install apache-airflow[postgres]
+         sudo -H pip install six==1.10.0
+         sudo pip install --upgrade six
+         sudo pip install markupsafe
+         sudo pip install --upgrade MarkupSafe
+         echo 'export PATH=/usr/local/bin:$PATH' >> /root/.bash_profile
+         source /root/.bash_profile
+         # Initialize Airflow
+         airflow initdb
+         # Update the RDS connection in the Airflow Config file
+         sed -i '/sql_alchemy_conn/s/^/#/g' ~/airflow/airflow.cfg
+         sed -i '/sql_alchemy_conn/ a sql_alchemy_conn = postgresql://airflow:${DBPassword}@${DBInstance.Endpoint.Address}:${DBInstance.Endpoint.Port}/airflowdb' ~/airflow/airflow.cfg
+         # Update the type of executor in the Airflow Config file
+         sed -i '/executor = SequentialExecutor/s/^/#/g' ~/airflow/airflow.cfg
+         sed -i '/executor = SequentialExecutor/ a executor = LocalExecutor' ~/airflow/airflow.cfg
+         airflow initdb
+         # Move all the files to the ~/airflow directory. The Airflow config file is setup to hold all the DAG related files in the ~/airflow/ folder.
+         mv aws-concurrent-data-orchestration-pipeline-emr-livy/* ~/airflow/
+         # Delete the higher-level git repository directory
+         rm -rf aws-concurrent-data-orchestration-pipeline-emr-livy
+         # Replace the name of the S3 bucket in each of the .scala files. CHANGE THE HIGHLIGHTED PORTION BELOW TO THE NAME OF THE S3 BUCKET YOU CREATED IN STEP 1. The below command replaces the instance of the string ‘<s3-bucket>’ in each of the scripts to the name of the actual bucket.
+         sed -i 's/<s3-bucket>/${S3BucketName}/g' /root/airflow/dags/transform/*
+         # Run Airflow webserver
+         airflow webserver
     Metadata:
       AWS::CloudFormation::Init:
         configSets:
@@ -189,16 +140,14 @@ Resources:
       Engine: postgres
       MasterUsername: airflow
       MasterUserPassword: !Ref 'DBPassword'
-      DBInstanceClass: db.t3.micro
+      DBInstanceClass: db.t2.small
       AllocatedStorage: 5
-      VPCSecurityGroups:
-        - !Ref RdsSecurityGroup
-      DBSubnetGroupName: !Ref 'DBSubnetGroup'     
+      DBSecurityGroups:
+        - Ref: DBSecurityGroup
   AirflowEC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      VpcId: !Ref VPC
-      GroupName: AirflowEC2SG0129
+      GroupName: AirflowEC2SG
       GroupDescription: Enable HTTP access via port 80 + SSH access
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -216,9 +165,8 @@ Resources:
   AirflowEMRMasterEC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: AirflowEMRMasterSG0129
+      GroupName: AirflowEMRMasterSG
       GroupDescription: Airflow EMR Master SG
-      VpcId: !Ref VPC
     DependsOn:
       - AirflowEC2SecurityGroup
   AirflowEMRMasterInboundRule:
@@ -227,27 +175,20 @@ Resources:
       IpProtocol: tcp
       FromPort: '8998'
       ToPort: '8998'
-      SourceSecurityGroupId: !GetAtt AirflowEC2SecurityGroup.GroupId
-      GroupId: !GetAtt AirflowEMRMasterEC2SecurityGroup.GroupId
+      SourceSecurityGroupName: !Ref 'AirflowEC2SecurityGroup'
+      GroupName: !Ref 'AirflowEMRMasterEC2SecurityGroup'
   AirflowEMRSlaveEC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: AirflowEMRSlaveSG0129
+      GroupName: AirflowEMRSlaveSG
       GroupDescription: Airflow EMR Slave SG
-      VpcId: !Ref VPC
-  RdsSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
+  DBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
     Properties:
-      GroupDescription: "Security group for RDS instance"
-      VpcId: !Ref VPC 
-  RdsSecurityGroupIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref RdsSecurityGroup
-      SourceSecurityGroupId: !Ref AirflowEC2SecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432  # or your DB port
-      ToPort: 5432  
+      GroupDescription: Frontend Access
+      DBSecurityGroupIngress:
+        EC2SecurityGroupName:
+          Ref: AirflowEC2SecurityGroup
   EC2Role:
     Type: AWS::IAM::Role
     Properties:
